@@ -66,6 +66,9 @@ type decoratorController struct {
 	parentInformers common.InformerMap
 	childInformers  common.InformerMap
 
+	mutex   sync.Mutex
+	waiters map[string][]*sync.WaitGroup
+
 	finalizer *finalizer.Manager
 }
 
@@ -78,7 +81,8 @@ func newDecoratorController(resources *dynamicdiscovery.ResourceMap, dynClient *
 		parentInformers: make(common.InformerMap),
 		childInformers:  make(common.InformerMap),
 
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DecoratorController-"+dc.Name),
+		queue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DecoratorController-"+dc.Name),
+		waiters: make(map[string][]*sync.WaitGroup),
 		finalizer: &finalizer.Manager{
 			Name:    "metacontroller.app/decoratorcontroller-" + dc.Name,
 			Enabled: dc.Spec.Hooks.Finalize != nil,
@@ -228,6 +232,30 @@ func (c *decoratorController) Stop() {
 	}
 }
 
+func (c *decoratorController) Resynchronize(selector labels.Selector, wg *sync.WaitGroup) error {
+	keys := []string{}
+	for _, informer := range c.parentInformers {
+		ccs, err := informer.Lister().List(selector)
+		if err != nil {
+			return err
+		}
+		for _, cc := range ccs {
+			key, err := parentQueueKey(cc)
+			if err != nil {
+				return fmt.Errorf("couldn't get key for object %+v: %v", cc, err)
+			}
+			keys = append(keys, key)
+		}
+
+		c.mutex.Lock()
+		defer c.mutex.Unlock()
+		for _, key := range keys {
+			c.waiters[key] = append(c.waiters[key], wg)
+		}
+	}
+	return nil
+}
+
 func (c *decoratorController) worker() {
 	for c.processNextWorkItem() {
 	}
@@ -247,8 +275,19 @@ func (c *decoratorController) processNextWorkItem() bool {
 		return true
 	}
 
+	c.notifyWaiters(key.(string))
 	c.queue.Forget(key)
 	return true
+}
+
+func (c *decoratorController) notifyWaiters(key string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	waiters := c.waiters[key]
+	for _, waiter := range waiters {
+		waiter.Done()
+	}
+	delete(c.waiters, key)
 }
 
 func (c *decoratorController) enqueueParentObject(obj interface{}) {

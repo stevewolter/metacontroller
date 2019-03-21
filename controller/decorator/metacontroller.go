@@ -24,6 +24,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -46,7 +47,9 @@ type Metacontroller struct {
 	dcLister   mclisters.DecoratorControllerLister
 	dcInformer cache.SharedIndexInformer
 
-	queue                workqueue.RateLimitingInterface
+	queue workqueue.RateLimitingInterface
+
+	mutex                sync.Mutex
 	decoratorControllers map[string]*decoratorController
 
 	stopCh, doneCh chan struct{}
@@ -114,6 +117,16 @@ func (mc *Metacontroller) Stop() {
 	wg.Wait()
 }
 
+func (mc *Metacontroller) Resynchronize(crdName string, selector labels.Selector, wg *sync.WaitGroup) error {
+	mc.mutex.Lock()
+	dc, ok := mc.decoratorControllers[crdName]
+	mc.mutex.Unlock()
+	if !ok {
+		return nil
+	}
+	return dc.Resynchronize(selector, wg)
+}
+
 func (mc *Metacontroller) processNextWorkItem() bool {
 	key, quit := mc.queue.Get()
 	if quit {
@@ -140,6 +153,8 @@ func (mc *Metacontroller) sync(key string) error {
 
 	glog.V(4).Infof("sync DecoratorController %v", name)
 
+	mc.mutex.Lock()
+	defer mc.mutex.Unlock()
 	dc, err := mc.dcLister.Get(name)
 	if apierrors.IsNotFound(err) {
 		glog.V(4).Infof("DecoratorController %v has been deleted", name)

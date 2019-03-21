@@ -64,7 +64,7 @@ func main() {
 		glog.Fatal(err)
 	}
 
-	stopServer, err := server.Start(config, *discoveryInterval, *informerRelist)
+	srv, err := server.Start(config, *discoveryInterval, *informerRelist)
 	if err != nil {
 		glog.Fatal(err)
 	}
@@ -77,12 +77,21 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", exporter)
-	srv := &http.Server{
+	mux.HandleFunc("/resynchronize", func(resp http.ResponseWriter, req *http.Request) {
+		err := srv.Resynchronize(req.URL.Query().Get("crdname"), nil, true)
+		if err != nil {
+			resp.WriteHeader(http.StatusInternalServerError)
+			resp.Write([]byte(err.Error()))
+			return
+		}
+		resp.WriteHeader(http.StatusOK)
+	})
+	httpServer := &http.Server{
 		Addr:    *debugAddr,
 		Handler: mux,
 	}
 	go func() {
-		glog.Errorf("Error serving debug endpoint: %v", srv.ListenAndServe())
+		glog.Errorf("Error serving debug endpoint: %v", httpServer.ListenAndServe())
 	}()
 
 	// On SIGTERM, stop all controllers gracefully.
@@ -91,6 +100,6 @@ func main() {
 	sig := <-sigchan
 	glog.Infof("Received %q signal. Shutting down...", sig)
 
-	stopServer()
-	srv.Shutdown(context.Background())
+	srv.Stop()
+	httpServer.Shutdown(context.Background())
 }

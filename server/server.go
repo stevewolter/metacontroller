@@ -24,6 +24,7 @@ import (
 	"github.com/0xRLG/ocworkqueue"
 	"go.opencensus.io/stats/view"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
@@ -43,9 +44,39 @@ import (
 type controller interface {
 	Start()
 	Stop()
+	Resynchronize(crdName string, selector labels.Selector, wg *sync.WaitGroup) error
 }
 
-func Start(config *rest.Config, discoveryInterval, informerRelist time.Duration) (stop func(), err error) {
+type Server struct {
+	controllers []controller
+}
+
+func (s *Server) Resynchronize(crdName string, selector labels.Selector, blocking bool) error {
+	wg := &sync.WaitGroup{}
+	for _, c := range s.controllers {
+		if err := c.Resynchronize(crdName, selector, wg); err != nil {
+			return err
+		}
+	}
+	if blocking {
+		wg.Wait()
+	}
+	return nil
+}
+
+func (s *Server) Stop() {
+	var wg sync.WaitGroup
+	for _, c := range s.controllers {
+		wg.Add(1)
+		go func(c controller) {
+			defer wg.Done()
+			c.Stop()
+		}(c)
+	}
+	wg.Wait()
+}
+
+func Start(config *rest.Config, discoveryInterval, informerRelist time.Duration) (*Server, error) {
 	// Periodically refresh discovery to pick up newly-installed resources.
 	dc := discovery.NewDiscoveryClientForConfigOrDie(config)
 	resources := dynamicdiscovery.NewResourceMap(dc)
@@ -72,9 +103,11 @@ func Start(config *rest.Config, discoveryInterval, informerRelist time.Duration)
 
 	// Start metacontrollers (controllers that spawn controllers).
 	// Each one requests the informers it needs from the factory.
-	controllers := []controller{
-		composite.NewMetacontroller(resources, dynClient, dynInformers, mcInformerFactory, mcClient),
-		decorator.NewMetacontroller(resources, dynClient, dynInformers, mcInformerFactory),
+	srv := &Server{
+		controllers: []controller{
+			composite.NewMetacontroller(resources, dynClient, dynInformers, mcInformerFactory, mcClient),
+			decorator.NewMetacontroller(resources, dynClient, dynInformers, mcInformerFactory),
+		},
 	}
 
 	// Start all requested informers.
@@ -82,20 +115,10 @@ func Start(config *rest.Config, discoveryInterval, informerRelist time.Duration)
 	mcInformerFactory.Start(nil)
 
 	// Start all controllers.
-	for _, c := range controllers {
+	for _, c := range srv.controllers {
 		c.Start()
 	}
 
 	// Return a function that will stop all controllers.
-	return func() {
-		var wg sync.WaitGroup
-		for _, c := range controllers {
-			wg.Add(1)
-			go func(c controller) {
-				defer wg.Done()
-				c.Stop()
-			}(c)
-		}
-		wg.Wait()
-	}, nil
+	return srv, nil
 }

@@ -64,6 +64,9 @@ type parentController struct {
 	updateStrategy updateStrategyMap
 	childInformers common.InformerMap
 
+	mutex   sync.Mutex
+	waiters map[string][]*sync.WaitGroup
+
 	finalizer *finalizer.Manager
 }
 
@@ -118,6 +121,7 @@ func newParentController(resources *dynamicdiscovery.ResourceMap, dynClient *dyn
 		revisionLister: revisionLister,
 		updateStrategy: updateStrategy,
 		queue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "CompositeController-"+cc.Name),
+		waiters:        make(map[string][]*sync.WaitGroup),
 		finalizer: &finalizer.Manager{
 			Name:    "metacontroller.app/compositecontroller-" + cc.Name,
 			Enabled: cc.Spec.Hooks.Finalize != nil,
@@ -206,6 +210,28 @@ func (pc *parentController) Stop() {
 	pc.parentInformer.Close()
 }
 
+func (pc *parentController) Resynchronize(selector labels.Selector, wg *sync.WaitGroup) error {
+	keys := []string{}
+	ccs, err := pc.parentInformer.Lister().List(selector)
+	if err != nil {
+		return err
+	}
+	for _, cc := range ccs {
+		key, err := common.KeyFunc(cc)
+		if err != nil {
+			return fmt.Errorf("couldn't get key for object %+v: %v", cc, err)
+		}
+		keys = append(keys, key)
+	}
+
+	pc.mutex.Lock()
+	defer pc.mutex.Unlock()
+	for _, key := range keys {
+		pc.waiters[key] = append(pc.waiters[key], wg)
+	}
+	return nil
+}
+
 func (pc *parentController) worker() {
 	for pc.processNextWorkItem() {
 	}
@@ -225,8 +251,19 @@ func (pc *parentController) processNextWorkItem() bool {
 		return true
 	}
 
+	pc.notifyWaiters(key.(string))
 	pc.queue.Forget(key)
 	return true
+}
+
+func (pc *parentController) notifyWaiters(key string) {
+	pc.mutex.Lock()
+	defer pc.mutex.Unlock()
+	waiters := pc.waiters[key]
+	for _, waiter := range waiters {
+		waiter.Done()
+	}
+	delete(pc.waiters, key)
 }
 
 func (pc *parentController) enqueueParentObject(obj interface{}) {

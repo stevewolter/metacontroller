@@ -24,6 +24,7 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -40,6 +41,7 @@ import (
 )
 
 type Metacontroller struct {
+	mutex        sync.Mutex
 	resources    *dynamicdiscovery.ResourceMap
 	mcClient     mcclientset.Interface
 	dynClient    *dynamicclientset.Clientset
@@ -121,6 +123,16 @@ func (mc *Metacontroller) Stop() {
 	wg.Wait()
 }
 
+func (mc *Metacontroller) Resynchronize(crdName string, selector labels.Selector, wg *sync.WaitGroup) error {
+	mc.mutex.Lock()
+	pc, ok := mc.parentControllers[crdName]
+	mc.mutex.Unlock()
+	if !ok {
+		return nil
+	}
+	return pc.Resynchronize(selector, wg)
+}
+
 func (mc *Metacontroller) processNextWorkItem() bool {
 	key, quit := mc.queue.Get()
 	if quit {
@@ -164,6 +176,8 @@ func (mc *Metacontroller) sync(key string) error {
 }
 
 func (mc *Metacontroller) syncCompositeController(cc *v1alpha1.CompositeController) error {
+	mc.mutex.Lock()
+	defer mc.mutex.Lock()
 	if pc, ok := mc.parentControllers[cc.Name]; ok {
 		// The controller was already started.
 		if apiequality.Semantic.DeepEqual(cc.Spec, pc.cc.Spec) {
